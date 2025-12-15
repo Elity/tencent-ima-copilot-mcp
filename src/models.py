@@ -2,7 +2,7 @@
 数据模型定义
 """
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, HttpUrl, field_serializer
 from enum import Enum
 
@@ -143,7 +143,23 @@ class InitSessionRequest(BaseModel):
 
 class SessionInfo(BaseModel):
     id: str
-    # other fields can be added if needed
+    by_knowledge_base_id: Optional[str] = None
+    cover_url: Optional[str] = None
+    create_ts: Optional[str] = None
+    get_msgs_last_ts: Optional[str] = None
+    interact_type: Optional[int] = None
+    is_msgs_end: Optional[bool] = None
+    knowledge_base_info_with_folder: Optional[KnowledgeBaseInfoWithFolder] = None
+    medias: Optional[List[Any]] = None
+    mission_task_id: Optional[str] = None
+    msgs: Optional[List[Any]] = None
+    name: Optional[str] = None
+    related_content: Optional[str] = None
+    related_url: Optional[str] = None
+    robot_type: Optional[int] = None
+    scene_type: Optional[int] = None
+    session_type: Optional[int] = None
+    update_ts: Optional[str] = None
 
 
 class InitSessionResponse(BaseModel):
@@ -151,6 +167,12 @@ class InitSessionResponse(BaseModel):
     msg: str
     session_id: Optional[str] = None
     session_info: Optional[SessionInfo] = None
+    attach_task_infos: Optional[List[Any]] = None
+    by_keyword: Optional[str] = None
+    child_sessions: Optional[List[Any]] = None
+    cos_credential: Optional[Any] = None
+    knowledge_base_info: Optional[Any] = None
+    preview_url: Optional[str] = None
 
 
 class IMAConfig(BaseModel):
@@ -215,19 +237,44 @@ class IMAStatus(BaseModel):
     session_info: Optional[Dict[str, Any]] = None
 
 
-class MCPToolResult(BaseModel):
-    """MCP 工具执行结果"""
-    success: bool
-    content: str
-    error: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
 
 
-class AskQuestionArgs(BaseModel):
-    """询问问题参数"""
-    question: str = Field(..., description="要询问的问题")
-    include_knowledge: bool = Field(True, description="是否包含知识库信息")
-    max_length: Optional[int] = Field(None, description="最大响应长度")
+
+class KnowledgeQaInfo(BaseModel):
+    tags: List[str] = []
+    knowledge_ids: List[str] = []
+
+
+class CommandInfo(BaseModel):
+    type: int
+    knowledge_qa_info: KnowledgeQaInfo
+
+
+class ModelInfo(BaseModel):
+    model_type: int
+    enable_enhancement: bool
+
+
+class DeviceInfo(BaseModel):
+    uskey: str
+    uskey_bus_infos_input: str
+
+
+class HistoryInfo(BaseModel):
+    # This seems to be an empty object, define it as such for now
+    pass
+
+
+class AskQuestionRequest(BaseModel):
+    session_id: str
+    robot_type: int
+    question: str
+    question_type: int
+    client_id: str
+    command_info: CommandInfo
+    model_info: ModelInfo
+    history_info: HistoryInfo
+    device_info: DeviceInfo
 
 
 class SearchStocksArgs(BaseModel):

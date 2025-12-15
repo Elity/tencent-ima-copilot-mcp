@@ -1,21 +1,17 @@
 """
 配置管理系统 - 基于环境变量的简化版本
 """
-import logging
-import os
 import uuid
 import base64
 import secrets
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, Optional
 
+from loguru import logger
 from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from models import IMAConfig, IMAStatus
-
-logger = logging.getLogger(__name__)
 
 
 class AppConfig(BaseSettings):
@@ -76,6 +72,9 @@ class IMAEnvironmentConfig(BaseSettings):
     knowledge_base_id: str = "7305806844290061"  # 默认值
     uskey: Optional[str] = None
     client_id: Optional[str] = None
+    robot_type: int = 5
+    scene_type: int = 1
+    model_type: int = 4
 
     model_config = SettingsConfigDict(
         env_prefix="IMA_",
@@ -123,6 +122,9 @@ class ConfigManager:
                 'knowledge_base_id': self.env_config.knowledge_base_id,
                 'uskey': self.env_config.uskey,
                 'client_id': self.env_config.client_id,
+                'robot_type': self.env_config.robot_type,
+                'scene_type': self.env_config.scene_type,
+                'model_type': self.env_config.model_type,
                 'timeout': self.app_config.request_timeout,
                 'retry_count': self.app_config.retry_count,
                 'proxy': self.app_config.proxy,

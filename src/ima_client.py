@@ -3,12 +3,13 @@ IMA API 客户端实现
 """
 import asyncio
 import base64
+import codecs
 import json
-import logging
 import random
 import re
 import secrets
 import string
+import time
 import traceback
 import uuid
 from datetime import datetime, timedelta
@@ -17,16 +18,24 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from urllib.parse import unquote
 
 import aiohttp
+from loguru import logger
+from tenacity import (
+    AsyncRetrying,
+    RetryError,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
 from models import (
     IMAConfig,
-    IMARequest,
     IMAMessage,
     MessageType,
     KnowledgeBaseMessage,
     TextMessage,
+    MediaInfo,
     DeviceInfo,
-    MCPToolResult,
     IMAStatus,
     TokenRefreshRequest,
     TokenRefreshResponse,
@@ -34,9 +43,14 @@ from models import (
     InitSessionResponse,
     EnvInfo,
     KnowledgeBaseInfoWithFolder,
+    AskQuestionRequest, # New
+    CommandInfo, # New
+    KnowledgeQaInfo, # New
+    ModelInfo, # New
+    HistoryInfo, # New
 )
 
-logger = logging.getLogger(__name__)
+
 
 
 class IMAAPIClient:
@@ -361,15 +375,20 @@ class IMAAPIClient:
                 ttl_dns_cache=300,
                 use_dns_cache=True,
                 keepalive_timeout=60,
-                enable_cleanup_closed=True,
             )
 
+            # SSE流式响应需要较长的超时时间
+            # total timeout用于整个请求，对于长时间的SSE流不应限制太严格
+            sse_timeout = max(self.config.timeout, 300)  # 至少5分钟
+            
             timeout = aiohttp.ClientTimeout(
-                total=min(self.config.timeout, 300),
-                sock_read=180,
-                connect=30,
-                sock_connect=30,
+                total=sse_timeout,      # 使用更长的总超时
+                sock_read=180,          # socket读取超时保持180秒
+                connect=30,             # 连接超时30秒
+                sock_connect=30,        # socket连接超时30秒
             )
+            
+            logger.debug(f"📡 [HTTP会话] 配置超时: total={sse_timeout}s, sock_read=180s, config.timeout={self.config.timeout}s")
 
             self.session = aiohttp.ClientSession(
                 connector=connector,
@@ -396,7 +415,7 @@ class IMAAPIClient:
         """生成临时 uskey"""
         return base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
 
-    def _build_request(self, question: str) -> IMARequest:
+    def _build_request(self, question: str) -> AskQuestionRequest:
         """构建 IMA API 请求"""
         session_id = self.current_session_id or self._generate_session_id()
         uskey = self._generate_temp_uskey()
@@ -411,24 +430,24 @@ class IMAAPIClient:
             uskey_bus_infos_input=f"{ima_guid}_{int(datetime.now().timestamp())}"
         )
 
-        return IMARequest(
+        return AskQuestionRequest(
             session_id=session_id,
             robot_type=self.config.robot_type,
             question=question,
-            question_type=2,
+            question_type=2, # As per the provided JSON structure
             client_id=self.config.client_id,
-            command_info={
-                "type": 14,
-                "knowledge_qa_info": {
-                    "tags": [],
-                    "knowledge_ids": []
-                }
-            },
-            model_info={
-                "model_type": self.config.model_type,
-                "enable_enhancement": False
-            },
-            history_info={},
+            command_info=CommandInfo(
+                type=14, # As per the provided JSON structure
+                knowledge_qa_info=KnowledgeQaInfo(
+                    tags=[],
+                    knowledge_ids=[]
+                )
+            ),
+            model_info=ModelInfo(
+                model_type=self.config.model_type,
+                enable_enhancement=False # As per the provided JSON structure
+            ),
+            history_info=HistoryInfo(), # As per the provided JSON structure (empty object)
             device_info=device_info
         )
 
@@ -523,17 +542,24 @@ class IMAAPIClient:
         has_received_data = False
         sample_chunks = []
         stream_error: Optional[str] = None
+        
+        # 使用增量解码器处理可能被截断的多字节字符
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         try:
             logger.debug(f"🔄 [SSE流] 开始读取 (trace_id={trace_id})")
+            logger.debug(f"  手动超时配置: initial={initial_timeout}s, chunk={chunk_timeout}s")
+            
             async for chunk in response.content:
                 current_time = asyncio.get_event_loop().time()
 
                 timeout_threshold = chunk_timeout if has_received_data else initial_timeout
                 elapsed_since_last_data = current_time - last_data_time
                 
+                # 手动超时检查（通常不会触发，因为aiohttp的timeout会先触发）
                 if elapsed_since_last_data > timeout_threshold:
-                    stream_error = f"Timeout after {elapsed_since_last_data:.1f}s with {message_count} chunks"
+                    stream_error = f"Manual timeout after {elapsed_since_last_data:.1f}s with {message_count} chunks"
+                    logger.warning(f"⏰ [SSE流] 手动超时触发: {stream_error}")
                     break
 
                 if chunk:
@@ -541,16 +567,8 @@ class IMAAPIClient:
                     last_data_time = current_time
                     message_count += 1
 
-                    try:
-                        chunk_str = chunk.decode('utf-8')
-                    except UnicodeDecodeError:
-                        # 尝试使用其他编码或忽略无效字节
-                        try:
-                            chunk_str = chunk.decode('gbk')
-                        except UnicodeDecodeError:
-                            # 如果都失败，使用错误处理模式
-                            chunk_str = chunk.decode('utf-8', errors='ignore')
-                            logger.warning(f"Chunk {message_count} 解码失败")
+                    # 使用增量解码器解码
+                    chunk_str = decoder.decode(chunk, final=False)
 
                     buffer += chunk_str
                     full_response += chunk_str
@@ -584,6 +602,12 @@ class IMAAPIClient:
             # 确保响应被正确关闭
             if not response.closed:
                 response.close()
+            
+            # 刷新解码器中剩余的字节
+            remaining_str = decoder.decode(b"", final=True)
+            if remaining_str:
+                buffer += remaining_str
+                full_response += remaining_str
 
             elapsed_time = asyncio.get_event_loop().time() - start_time
             self._persist_raw_response(
@@ -639,8 +663,16 @@ class IMAAPIClient:
         logger.info(f"✅ [SSE流] 处理完成 (trace_id={trace_id})")
         logger.info(f"  收到数据块: {message_count} 个, 成功解析: {parsed_message_count} 条, 失败: {failed_parse_count} 次")
         logger.info(f"  响应大小: {len(full_response)} 字节, 耗时: {elapsed_time:.1f} 秒")
+        
         if stream_error:
-            logger.info(f"  流错误: {stream_error}")
+            logger.warning(f"  ⚠️ 流错误: {stream_error}")
+        
+        # 诊断信息：如果耗时接近30秒，很可能是aiohttp的total timeout触发
+        if 29.0 <= elapsed_time <= 31.0:
+            logger.warning(f"  ⚠️ [诊断] 耗时正好约30秒，怀疑是aiohttp的ClientTimeout.total触发")
+            logger.warning(f"  ⚠️ [诊断] 建议检查 IMAConfig.timeout 配置值（当前: {getattr(self.config, 'timeout', 'N/A')}s）")
+            logger.warning(f"  ⚠️ [诊断] 对于长时间SSE流，建议将timeout设置为300秒以上")
+        
         logger.info("=" * 80)
 
         if message_count > 100 and parsed_message_count < 5:
@@ -693,31 +725,26 @@ class IMAAPIClient:
                                     try:
                                         context_data = json.loads(context_refs)
                                         if isinstance(context_data, dict):
-                                            ref_text = "\n\n📚 参考资料:\n"
+                                            # 解析 medias 并创建 KnowledgeBaseMessage
+                                            medias_list = []
                                             if 'medias' in context_data and isinstance(context_data['medias'], list):
-                                                for i, media in enumerate(context_data['medias'][:5], 1):
-                                                    title = media.get('title', f'资料{i}')
-                                                    intro = media.get('introduction', '')
-                                                    if intro:
-                                                        intro = intro[:150] + "..." if len(intro) > 150 else intro
-                                                        ref_text += f"{i}. {title}\n   {intro}\n"
-                                                    else:
-                                                        ref_text += f"{i}. {title}\n"
+                                                for media_data in context_data['medias']:
+                                                    try:
+                                                        # 尝试转换为 MediaInfo 对象
+                                                        media_info = MediaInfo(**media_data)
+                                                        medias_list.append(media_info)
+                                                    except Exception as e:
+                                                        logger.warning(f"Failed to parse media info: {e}")
 
-                                            if context_data.get('medias'):
-                                                messages.append(TextMessage(
-                                                    type=MessageType.TEXT,
-                                                    content=ref_text,
-                                                    text=ref_text,
-                                                    raw=str(last_msg)
+                                            if medias_list:
+                                                messages.append(KnowledgeBaseMessage(
+                                                    type=MessageType.KNOWLEDGE_BASE,
+                                                    content="参考资料",
+                                                    medias=medias_list,
+                                                    raw=context_refs
                                                 ))
                                     except json.JSONDecodeError:
-                                        messages.append(TextMessage(
-                                            type=MessageType.TEXT,
-                                            content=f"\n\n📚 参考资料:\n{context_refs}",
-                                            text=f"\n\n📚 参考资料:\n{context_refs}",
-                                            raw=str(last_msg)
-                                        ))
+                                        logger.warning(f"Failed to decode context_refs: {context_refs[:100]}...")
 
             logger.info(f"从响应中提取了 {len(messages)} 条消息")
             return messages
@@ -958,103 +985,112 @@ class IMAAPIClient:
         error_lower = error_str.lower()
         return any(pattern.lower() in error_lower for pattern in login_expired_patterns)
 
-    async def ask_question_complete(self, question: str) -> List[IMAMessage]:
+    async def ask_question_complete(self, question: str, timeout: Optional[float] = None) -> List[IMAMessage]:
         """获取完整的问题回答 - 支持自动 token 刷新重试"""
-        messages = []
-        max_retries = 2  # 最大重试次数
-        
-        # 生成主trace_id用于整个请求
         main_trace_id = str(uuid.uuid4())[:8]
         logger.info(f"🚀 开始问答 (trace_id={main_trace_id}): {question[:50]}...")
+        
+        start_time = time.time()
 
-        for attempt in range(max_retries + 1):  # 总共尝试 max_retries + 1 次
-            logger.debug(f"📍 尝试 {attempt + 1}/{max_retries + 1}")
+        async def _attempt_request():
+            # 检查总超时
+            if timeout and (time.time() - start_time > timeout):
+                raise asyncio.TimeoutError("Total timeout exceeded")
+
+            messages = []
+            gen = None
             try:
-                async for message in self.ask_question(question):
-                    messages.append(message)
-                    logger.debug(f"  收到消息 #{len(messages)}: {type(message).__name__}")
-
-                # 如果成功获取到消息，直接返回
-                if messages:
-                    logger.info(f"✅ 问答完成 ({len(messages)}条消息)")
-                    break
-                else:
-                    logger.warning(f"⚠️ [完整问答] 未获取到任何消息，尝试次数: {attempt + 1}/{max_retries + 1}")
+                # 动态计算剩余超时时间给单次请求
+                step_timeout = None
+                if timeout:
+                    step_timeout = timeout - (time.time() - start_time)
+                    if step_timeout <= 1.0:
+                         raise asyncio.TimeoutError("Time budget exhausted")
+                
+                # 执行请求
+                gen = self.ask_question(question)
+                try:
+                    while True:
+                         current_step_timeout = timeout - (time.time() - start_time) if timeout else None
+                         if current_step_timeout is not None and current_step_timeout <= 0.5:
+                             raise asyncio.TimeoutError("Approaching timeout")
+                         
+                         if current_step_timeout:
+                             msg = await asyncio.wait_for(gen.__anext__(), timeout=current_step_timeout)
+                         else:
+                             msg = await gen.__anext__()
+                         messages.append(msg)
+                except StopAsyncIteration:
+                    pass
+                
+                if not messages:
+                    raise ValueError("未收到有效消息")
+                
+                return messages
 
             except Exception as e:
+                # 检查是否是认证错误
                 error_str = str(e)
-                logger.error("=" * 80)
-                logger.error(f"❌ [完整问答] 尝试 {attempt + 1}/{max_retries + 1} 失败")
-                logger.error(f"  异常类型: {type(e).__name__}")
-                logger.error(f"  异常信息: {error_str[:200]}")
-                logger.error("=" * 80)
-
-                # 检查是否是登录过期错误
                 if self._is_login_expired_error(error_str):
-                    if attempt < max_retries:
-                        logger.info(f"🔄 认证错误，刷新token...")
-
-                        # 尝试刷新 token
-                        refresh_success = await self.refresh_token()
-                        if refresh_success:
-                            logger.info("✅ Token刷新成功，重试中...")
-                            # 重置会话状态，强制重新初始化
-                            self.session_initialized = False
-                            self.current_session_id = None
-                            # 关闭现有会话，重新创建
-                            if self.session and not self.session.closed:
-                                await self.session.close()
-                                self.session = None
-                            # 重置消息列表，准备重新尝试
-                            messages = []
-                            continue
-                        else:
-                            logger.error("❌ [完整问答] Token刷新失败，停止重试")
-                            break  # 刷新失败，直接退出循环，不再重试
+                    logger.warning(f"检测到认证错误: {e}")
+                    # 尝试刷新
+                    if await self.refresh_token():
+                        logger.info("Token刷新成功")
+                        # 重置会话状态
+                        if self.session and not self.session.closed:
+                            await self.session.close()
+                            self.session = None
+                        self.session_initialized = False
+                        self.current_session_id = None
+                        # 抛出特定异常，让 tenacity 捕获并重试
+                        raise ValueError("Token refreshed, retry required") from e
                     else:
-                        logger.error(f"❌ [完整问答] 已达最大重试次数 ({max_retries})，停止重试")
-                        break  # 达到最大重试次数，直接退出循环
-                else:
-                    # 如果不是登录过期错误，检查是否应该重试
-                    if attempt < max_retries:
-                        logger.info(f"🔄 [完整问答] 非认证错误，延迟1秒后重试...")
-                        logger.info(f"  错误摘要: {error_str[:100]}")
-                        # 重置消息列表，准备重新尝试
-                        messages = []
-                        # 短暂延迟后重试
-                        await asyncio.sleep(1)
-                        continue
-                    else:
-                        logger.error(f"❌ [完整问答] 已达最大重试次数 ({max_retries})，停止重试")
-                        break  # 达到最大重试次数，直接退出循环
+                        logger.error("Token刷新失败")
+                        # 刷新失败，抛出异常
+                        raise 
+                
+                # 其他异常直接抛出
+                raise
+            finally:
+                if gen:
+                    await gen.aclose()
 
-        # 如果循环结束但没有消息，添加错误消息
-        if not messages:
-            logger.error("=" * 80)
-            logger.error(f"❌ [完整问答] 所有尝试均失败，未获取到任何消息")
-            logger.error(f"  main_trace_id: {main_trace_id}")
-            logger.error("=" * 80)
-            error_message = IMAMessage(
-                type=MessageType.SYSTEM,
-                content=f"获取回答失败: 所有 {max_retries + 1} 次尝试均失败",
-                raw="All retries exhausted"
+        try:
+            retryer = AsyncRetrying(
+                stop=stop_after_attempt(self.config.retry_count + 1),
+                wait=wait_exponential(multiplier=1, min=1, max=10),
+                # 重试条件: 网络错误, 超时, 或者我们抛出的 Token refreshed 信号 (ValueError)
+                retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, ValueError)),
+                before_sleep=before_sleep_log(logger, "WARNING"),
+                reraise=True
             )
-            messages.append(error_message)
+            
+            async for attempt in retryer:
+                with attempt:
+                    return await _attempt_request()
 
-        return messages
+        except RetryError:
+            logger.error(f"❌ [完整问答] 重试耗尽")
+            return [IMAMessage(type=MessageType.SYSTEM, content="请求失败: 重试次数耗尽", raw="Retry exhausted")]
+        except Exception as e:
+            logger.error(f"❌ [完整问答] 失败: {e}")
+            return [IMAMessage(type=MessageType.SYSTEM, content=f"请求失败: {e}", raw=str(e))]
 
     def _extract_text_content(self, messages: List[IMAMessage]) -> str:
-        """从消息列表中提取文本内容 - 现在只处理answer和context_refs的拼接"""
+        """从消息列表中提取文本内容 - 仅提取文本类型的消息"""
         if not messages:
             return "没有收到任何响应"
 
         content_parts = []
 
         for message in messages:
-            if isinstance(message, TextMessage) and message.text:
-                content_parts.append(message.text)
-            elif hasattr(message, 'content') and message.content:
-                content_parts.append(message.content)
+            # 仅提取 TextMessage 且类型为 TEXT 的内容
+            # 过滤掉 SYSTEM (调试信息) 和 KNOWLEDGE_BASE (进度信息) 类型的消息
+            if message.type == MessageType.TEXT:
+                if isinstance(message, TextMessage) and message.text:
+                    content_parts.append(message.text)
+                elif hasattr(message, 'content') and message.content:
+                    content_parts.append(message.content)
 
         # 拼接所有内容
         final_result = ''.join(content_parts).strip()
@@ -1105,92 +1141,6 @@ class IMAAPIClient:
 
         return knowledge_items
 
-    async def validate_config(self) -> bool:
-        """验证配置是否有效"""
-        try:
-            # 发送一个简单的测试问题
-            test_messages = await self.ask_question_complete("测试连接")
-            return len(test_messages) > 0
-        except Exception as e:
-            logger.error(f"Config validation failed: {e}")
-            return False
 
-    async def get_status(self) -> IMAStatus:
-        """获取客户端状态"""
-        status = IMAStatus()
-
-        if not self.config:
-            return status
-
-        status.is_configured = True
-
-        try:
-            # 验证认证状态
-            is_valid = await self.validate_config()
-            status.is_authenticated = is_valid
-            status.last_test_time = datetime.now()
-
-            if not is_valid:
-                status.error_message = "认证失败，请检查配置"
-
-        except Exception as e:
-            status.error_message = str(e)
-            logger.error(f"Failed to get status: {e}")
-
-        return status
-
-
-class IMAToolExecutor:
-    """IMA 工具执行器"""
-
-    def __init__(self, client: IMAAPIClient):
-        self.client = client
-
-    async def ask_question(self, question: str, include_knowledge: bool = True) -> MCPToolResult:
-        """执行询问问题工具"""
-        try:
-            messages = await self.client.ask_question_complete(question)
-
-            if not messages:
-                return MCPToolResult(
-                    success=False,
-                    content="",
-                    error="未收到响应"
-                )
-
-            # 提取主要回答内容
-            answer_text = self.client._extract_text_content(messages)
-
-            # 构建响应内容
-            content_parts = [f"**问题**: {question}\n\n**回答**:\n{answer_text}"]
-
-            # 添加知识库信息（如果需要）
-            if include_knowledge:
-                knowledge_info = self.client._extract_knowledge_info(messages)
-                if knowledge_info:
-                    content_parts.append("\n\n**参考资料**:")
-                    for i, item in enumerate(knowledge_info[:5], 1):  # 最多显示5个参考资料
-                        content_parts.append(f"{i}. {item['title']}")
-                        if item.get('introduction'):
-                            content_parts.append(f"   {item['introduction'][:100]}...")
-
-            final_content = '\n'.join(content_parts)
-
-            return MCPToolResult(
-                success=True,
-                content=final_content,
-                metadata={
-                    'message_count': len(messages),
-                    'knowledge_sources': len(self.client._extract_knowledge_info(messages))
-                }
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to execute ask_question: {e}")
-            return MCPToolResult(
-                success=False,
-                content="",
-                error=f"询问失败: {str(e)}"
-            )
 
   
