@@ -287,15 +287,11 @@ def main():
 
     # 验证配置
     config = get_config()
-    if config:
-        print("[OK] 配置加载成功")
-        is_valid, error = config_manager.validate_config()
-        if is_valid:
-            print("[OK] 配置验证通过")
-        else:
-            print(f"[ERROR] 配置验证失败: {error}")
+    if config and config.x_ima_cookie and config.x_ima_bkn:
+        print("[OK] 配置加载成功，必需认证信息已设置")
     else:
-        print("[ERROR] 配置加载失败，请检查环境变量")
+        print("[ERROR] 配置加载失败或必需认证信息缺失，请检查环境变量")
+        sys.exit(1) # Added exit if config is bad
 
     print("=" * 50)
     print("启动命令:")

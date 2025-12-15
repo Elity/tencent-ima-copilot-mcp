@@ -1,5 +1,5 @@
 # Multi-stage build for smaller final image
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -18,7 +18,6 @@ COPY --from=builder /root/.local /root/.local
 # Copy application code
 COPY src/ ./src/
 COPY ima_server_simple.py .
-COPY run.py .
 
 # Make sure scripts are in PATH
 ENV PATH=/root/.local/bin:$PATH
