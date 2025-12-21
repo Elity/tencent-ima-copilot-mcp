@@ -69,12 +69,19 @@ class IMAEnvironmentConfig(BaseSettings):
     cookies: str = ""
     x_ima_cookie: str = ""
     x_ima_bkn: str = ""
-    knowledge_base_id: str = "7305806844290061"  # 默认值
+    
+    # 默认配置常量
+    DEFAULT_KNOWLEDGE_BASE_ID: str = "7305806844290061"
+    DEFAULT_ROBOT_TYPE: int = 5
+    DEFAULT_SCENE_TYPE: int = 1
+    DEFAULT_MODEL_TYPE: int = 4
+
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID
     uskey: Optional[str] = None
     client_id: Optional[str] = None
-    robot_type: int = 5
-    scene_type: int = 1
-    model_type: int = 4
+    robot_type: int = DEFAULT_ROBOT_TYPE
+    scene_type: int = DEFAULT_SCENE_TYPE
+    model_type: int = DEFAULT_MODEL_TYPE
 
     model_config = SettingsConfigDict(
         env_prefix="IMA_",
@@ -119,12 +126,12 @@ class ConfigManager:
                 'cookies': self.env_config.cookies,
                 'x_ima_cookie': self.env_config.x_ima_cookie,
                 'x_ima_bkn': self.env_config.x_ima_bkn,
-                'knowledge_base_id': self.env_config.knowledge_base_id,
+                'knowledge_base_id': self.env_config.knowledge_base_id or self.env_config.DEFAULT_KNOWLEDGE_BASE_ID,
                 'uskey': self.env_config.uskey,
                 'client_id': self.env_config.client_id,
-                'robot_type': self.env_config.robot_type,
-                'scene_type': self.env_config.scene_type,
-                'model_type': self.env_config.model_type,
+                'robot_type': self.env_config.robot_type or self.env_config.DEFAULT_ROBOT_TYPE,
+                'scene_type': self.env_config.scene_type or self.env_config.DEFAULT_SCENE_TYPE,
+                'model_type': self.env_config.model_type or self.env_config.DEFAULT_MODEL_TYPE,
                 'timeout': self.app_config.request_timeout,
                 'retry_count': self.app_config.retry_count,
                 'proxy': self.app_config.proxy,

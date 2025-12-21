@@ -22,6 +22,7 @@ from loguru import logger
 from tenacity import (
     AsyncRetrying,
     RetryError,
+    retry,
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
@@ -63,9 +64,8 @@ class IMAAPIClient:
         self.refresh_endpoint = "/cgi-bin/auth_login/refresh"
         self.init_session_endpoint = "/cgi-bin/session_logic/init_session"
         self.session: Optional[aiohttp.ClientSession] = None
-        self.current_session_id: Optional[str] = None
-        self.session_initialized: bool = False
         self.raw_log_dir: Optional[Path] = None
+        self._token_lock = asyncio.Lock()  # 保护 token 刷新过程
 
         if getattr(self.config, "enable_raw_logging", False):
             raw_dir_value = getattr(self.config, "raw_log_dir", None)
@@ -160,7 +160,8 @@ class IMAAPIClient:
             return True
         
         expired_time = self.config.token_updated_at + timedelta(seconds=self.config.token_valid_time)
-        return datetime.now() > expired_time
+        # 提前 5 分钟刷新以防万一
+        return datetime.now() > (expired_time - timedelta(minutes=5))
 
     def _parse_user_id_from_cookies(self) -> Optional[str]:
         """从IMA_X_IMA_COOKIE中解析IMA-UID"""
@@ -211,108 +212,96 @@ class IMAAPIClient:
             logger.error(f"解析 refresh_token 失败: {e}\n{traceback.format_exc()}")
         return None
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True
+    )
     async def refresh_token(self) -> bool:
         """刷新访问令牌"""
-        logger.info("🔄 开始刷新 Token")
-        
-        if not self.config.user_id or not self.config.refresh_token:
-            logger.info("从 cookies 中解析 user_id 和 refresh_token")
-            self.config.user_id = self._parse_user_id_from_cookies()
-            self.config.refresh_token = self._parse_refresh_token_from_cookies()
+        async with self._token_lock:
+            # 双重检查
+            if not self._is_token_expired() and self.config.current_token:
+                return True
 
+            logger.info("🔄 开始刷新 Token")
+            
             if not self.config.user_id or not self.config.refresh_token:
-                logger.warning("缺少token刷新所需的user_id或refresh_token")
-                return False
+                logger.info("从 cookies 中解析 user_id 和 refresh_token")
+                self.config.user_id = self._parse_user_id_from_cookies()
+                self.config.refresh_token = self._parse_refresh_token_from_cookies()
 
-        try:
-            session = await self._get_session()
-
-            # 构建刷新请求
-            refresh_request = TokenRefreshRequest(
-                user_id=self.config.user_id,
-                refresh_token=self.config.refresh_token
-            )
-
-            refresh_url = f"{self.base_url}{self.refresh_endpoint}"
-            
-            # 构建请求头 - 添加 x-ima-bkn
-            refresh_headers = {
-                "accept": "*/*",
-                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-                "content-type": "application/json",
-                "from_browser_ima": "1",
-                "x-ima-cookie": self.config.x_ima_cookie,
-                "x-ima-bkn": self.config.x_ima_bkn,
-                "referer": "https://ima.qq.com/wikis"
-            }
-            
-            request_body = refresh_request.model_dump()
-
-            async with session.post(
-                refresh_url,
-                json=request_body,
-                headers=refresh_headers
-            ) as response:
-                response_text = await response.text()
-                if response.status == 200:
-                    try:
-                        response_data = await response.json()
-                        refresh_response = TokenRefreshResponse(**response_data)
-
-                        if refresh_response.code == 0 and refresh_response.token:
-                            # 更新token信息
-                            self.config.current_token = refresh_response.token
-                            self.config.token_valid_time = int(refresh_response.token_valid_time or "7200")
-                            self.config.token_updated_at = datetime.now()
-
-                            logger.info(f"✅ Token刷新成功 (有效期: {self.config.token_valid_time}秒)")
-                            return True
-                        else:
-                            logger.warning("=" * 60)
-                            logger.warning(f"Token刷新失败")
-                            logger.warning(f"  响应代码: {refresh_response.code}")
-                            logger.warning(f"  错误信息: {refresh_response.msg}")
-                            # 尝试从原始响应数据中获取更多错误信息
-                            if 'type' in response_data:
-                                logger.warning(f"  响应类型: {response_data['type']}")
-                            if 'caused_by' in response_data:
-                                logger.warning(f"  引起原因: {response_data['caused_by']}")
-                            logger.warning("=" * 60)
-                            return False
-                    except json.JSONDecodeError as je:
-                        logger.error(f"无法解析响应为 JSON: {je}")
-                        logger.error(f"原始响应: {response_text[:200]}")
-                        return False
-                else:
-                    logger.error("=" * 60)
-                    logger.error(f"Token刷新请求失败")
-                    logger.error(f"  状态码: {response.status}")
-                    logger.error(f"  响应内容: {response_text[:200]}")
-                    logger.error("=" * 60)
+                if not self.config.user_id or not self.config.refresh_token:
+                    logger.warning("缺少token刷新所需的user_id或refresh_token")
                     return False
 
-        except Exception as e:
-            logger.error(f"Token刷新异常: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-            return False
+            try:
+                session = await self._get_session()
+
+                # 构建刷新请求
+                refresh_request = TokenRefreshRequest(
+                    user_id=self.config.user_id,
+                    refresh_token=self.config.refresh_token
+                )
+
+                refresh_url = f"{self.base_url}{self.refresh_endpoint}"
+                
+                # 构建请求头 - 不使用 _build_headers 以避免发送过期的 token
+                refresh_headers = {
+                    "accept": "application/json",
+                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+                    "content-type": "application/json",
+                    "from_browser_ima": "1",
+                    "x-ima-cookie": self.config.x_ima_cookie,
+                    "x-ima-bkn": self.config.x_ima_bkn,
+                    "referer": "https://ima.qq.com/wikis",
+                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+                }
+                
+                request_body = refresh_request.model_dump()
+
+                async with session.post(
+                    refresh_url,
+                    json=request_body,
+                    headers=refresh_headers
+                ) as response:
+                    response_text = await response.text()
+                    if response.status == 200:
+                        try:
+                            response_data = await response.json()
+                            refresh_response = TokenRefreshResponse(**response_data)
+
+                            if refresh_response.code == 0 and refresh_response.token:
+                                # 更新token信息
+                                self.config.current_token = refresh_response.token
+                                self.config.token_valid_time = int(refresh_response.token_valid_time or "7200")
+                                self.config.token_updated_at = datetime.now()
+
+                                logger.info(f"✅ Token刷新成功 (有效期: {self.config.token_valid_time}秒)")
+                                return True
+                            else:
+                                logger.warning("=" * 60)
+                                logger.warning(f"Token刷新失败: {refresh_response.msg} (Code: {refresh_response.code})")
+                                logger.warning("=" * 60)
+                                return False
+                        except json.JSONDecodeError as je:
+                            logger.error(f"无法解析响应为 JSON: {je}")
+                            logger.error(f"原始响应: {response_text[:200]}")
+                            return False
+                    else:
+                        logger.error(f"Token刷新请求失败: HTTP {response.status}")
+                        return False
+
+            except Exception as e:
+                logger.error(f"Token刷新异常: {type(e).__name__}: {e}")
+                return False
 
     async def ensure_valid_token(self) -> bool:
         """确保token有效，如果过期则刷新"""
         if self._is_token_expired():
-            if self.config.refresh_token and self.config.user_id:
-                logger.info("Token已过期，尝试刷新...")
-                return await self.refresh_token()
-            else:
-                logger.info("尝试从cookies中解析refresh_token并主动刷新...")
-                self.config.user_id = self._parse_user_id_from_cookies()
-                self.config.refresh_token = self._parse_refresh_token_from_cookies()
-                
-                if self.config.refresh_token and self.config.user_id:
-                    logger.info("成功从cookies中解析凭据，开始刷新token...")
-                    return await self.refresh_token()
-                else:
-                    logger.warning("无法从cookies中解析refresh_token，将使用原始cookies")
-                    return True
-
+            return await self.refresh_token()
         return True
 
     
@@ -334,15 +323,16 @@ class IMAAPIClient:
         """构建请求头"""
         x_ima_cookie = self.config.x_ima_cookie
         
+        # 如果有新的 token，动态替换到 Cookie 中
         if self.config.current_token:
-            x_ima_cookie = re.sub(
-                r'IMA-TOKEN=[^;]+',
-                f'IMA-TOKEN={self.config.current_token}',
-                x_ima_cookie
-            )
-            
-            if 'IMA-TOKEN=' not in x_ima_cookie:
-                x_ima_cookie = x_ima_cookie + f'; IMA-TOKEN={self.config.current_token}'
+            if 'IMA-TOKEN=' in x_ima_cookie:
+                x_ima_cookie = re.sub(
+                    r'IMA-TOKEN=[^;]+',
+                    f'IMA-TOKEN={self.config.current_token}',
+                    x_ima_cookie
+                )
+            else:
+                x_ima_cookie = x_ima_cookie.rstrip('; ') + f'; IMA-TOKEN={self.config.current_token}'
         
         headers = {
             "x-ima-cookie": x_ima_cookie,
@@ -353,12 +343,7 @@ class IMAAPIClient:
             "accept": "application/json" if for_init_session else "text/event-stream",
             "content-type": "application/json",
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-            "sec-ch-ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
+            "referer": "https://ima.qq.com/wikis",
         }
 
         if self.config.current_token:
@@ -366,7 +351,14 @@ class IMAAPIClient:
         
         return headers
 
-    async def _get_session(self, for_init_session: bool = False) -> aiohttp.ClientSession:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type((aiohttp.ClientError, OSError)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True
+    )
+    async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 HTTP 会话"""
         if self.session is None or self.session.closed:
             connector = aiohttp.TCPConnector(
@@ -377,24 +369,20 @@ class IMAAPIClient:
                 keepalive_timeout=60,
             )
 
-            # SSE流式响应需要较长的超时时间
-            # total timeout用于整个请求，对于长时间的SSE流不应限制太严格
-            sse_timeout = max(self.config.timeout, 300)  # 至少5分钟
+            sse_timeout = 600  # 增加总超时到 10 分钟以支持极长回复
             
             timeout = aiohttp.ClientTimeout(
-                total=sse_timeout,      # 使用更长的总超时
-                sock_read=180,          # socket读取超时保持180秒
-                connect=30,             # 连接超时30秒
-                sock_connect=30,        # socket连接超时30秒
+                total=sse_timeout,
+                sock_read=180,
+                connect=30,
+                sock_connect=30,
             )
             
-            logger.debug(f"📡 [HTTP会话] 配置超时: total={sse_timeout}s, sock_read=180s, config.timeout={self.config.timeout}s")
-
             self.session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
                 cookies=self._parse_cookies(self.config.cookies or ""),
-                headers=self._build_headers(for_init_session),
+                # 注意：不在 session 层面固定 headers，因为 token 可能会变
                 trust_env=True,
                 read_bufsize=5 * 2**20,
                 auto_decompress=True,
@@ -415,9 +403,8 @@ class IMAAPIClient:
         """生成临时 uskey"""
         return base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
 
-    def _build_request(self, question: str) -> AskQuestionRequest:
+    def _build_request(self, question: str, session_id: str) -> AskQuestionRequest:
         """构建 IMA API 请求"""
-        session_id = self.current_session_id or self._generate_session_id()
         uskey = self._generate_temp_uskey()
 
         try:
@@ -434,10 +421,10 @@ class IMAAPIClient:
             session_id=session_id,
             robot_type=self.config.robot_type,
             question=question,
-            question_type=2, # As per the provided JSON structure
+            question_type=2,
             client_id=self.config.client_id,
             command_info=CommandInfo(
-                type=14, # As per the provided JSON structure
+                type=14,
                 knowledge_qa_info=KnowledgeQaInfo(
                     tags=[],
                     knowledge_ids=[]
@@ -445,9 +432,9 @@ class IMAAPIClient:
             ),
             model_info=ModelInfo(
                 model_type=self.config.model_type,
-                enable_enhancement=False # As per the provided JSON structure
+                enable_enhancement=False
             ),
-            history_info=HistoryInfo(), # As per the provided JSON structure (empty object)
+            history_info=HistoryInfo(),
             device_info=device_info
         )
 
@@ -758,8 +745,15 @@ class IMAAPIClient:
             ))
             return messages
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True
+    )
     async def init_session(self, knowledge_base_id: Optional[str] = None) -> str:
-        """初始化会话"""
+        """初始化会话并返回 session_id"""
         kb_id = knowledge_base_id or getattr(self.config, 'knowledge_base_id', '7305806844290061')
 
         logger.info(f"🔄 初始化会话 (知识库: {kb_id})")
@@ -767,7 +761,7 @@ class IMAAPIClient:
             logger.error("❌ 无法获取有效的访问令牌")
             raise ValueError("Authentication failed - unable to obtain valid token")
         
-        session = await self._get_session(for_init_session=True)
+        session = await self._get_session()
 
         init_request = InitSessionRequest(
             envInfo=EnvInfo(
@@ -787,279 +781,139 @@ class IMAAPIClient:
         
         url = f"{self.base_url}{self.init_session_endpoint}"
         request_json = init_request.model_dump()
+        headers = self._build_headers(for_init_session=True)
 
         try:
             async with session.post(
                 url,
                 json=request_json,
-                headers={"content-type": "application/json"}
+                headers=headers
             ) as response:
                 if response.status != 200:
                     response_text = await response.text()
                     logger.error(f"初始化会话失败，HTTP状态码: {response.status}")
-                    logger.error(f"响应内容: {response_text}")
                     raise ValueError(f"init_session HTTP错误 {response.status}: {response_text[:500]}")
                 
-                response.raise_for_status()
-
                 response_data = await response.json()
                 init_response = InitSessionResponse(**response_data)
 
                 if init_response.code == 0 and init_response.session_id:
-                    self.current_session_id = init_response.session_id
-                    self.session_initialized = True
-                    logger.info(f"✅ 会话初始化成功 (session_id: {self.current_session_id[:16]}...)")
-                    return self.current_session_id
+                    logger.info(f"✅ 会话初始化成功 (session_id: {init_response.session_id[:16]}...)")
+                    return init_response.session_id
                 else:
                     logger.error(f"❌ 会话初始化失败 (code: {init_response.code}): {init_response.msg}")
                     raise ValueError(f"Session initialization failed (code: {init_response.code}): {init_response.msg}")
 
-        except aiohttp.ClientError as e:
-            logger.error(f"会话初始化HTTP请求失败: {e}")
-            raise
         except Exception as e:
             logger.error(f"会话初始化异常: {e}")
             raise
 
-    async def ask_question(self, question: str) -> AsyncGenerator[IMAMessage, None]:
-        """向 IMA 询问问题"""
-        logger.debug(f"🔍 ask_question 被调用 (session: {self.current_session_id[:16] if self.current_session_id else 'None'}...)")
-        
+    async def ask_question(self, question: str, session_id: Optional[str] = None) -> AsyncGenerator[IMAMessage, None]:
+        """向 IMA 询问问题 (支持流式返回)"""
         if not question.strip():
             raise ValueError("Question cannot be empty")
 
         # 确保token有效
         if not await self.ensure_valid_token():
-            logger.error("❌ [诊断] 无法获取有效的访问令牌")
             raise ValueError("Authentication failed - unable to obtain valid token")
 
-        # 每次调用都初始化新会话，实现上下文隔离
-        logger.debug("🔄 初始化新会话（上下文隔离）")
-        
-        if self.session and not self.session.closed:
-            await self.session.close()
-            self.session = None
-        
-        # 重置会话状态
-        self.current_session_id = None
-        self.session_initialized = False
-        
-        try:
-            await self.init_session()
-        except Exception as init_error:
-            logger.error(f"❌ [诊断] 会话初始化失败: {init_error}")
-            logger.error("  这可能是导致 'No valid session ID provided' 错误的原因")
-            raise
+        # 如果没有提供 session_id，则动态初始化一个新会话（实现无状态/单次对话隔离）
+        if not session_id:
+            logger.debug("🔄 未提供 session_id，初始化临时会话...")
+            session_id = await self.init_session()
 
         session = await self._get_session()
-        request_data = self._build_request(question)
-
+        request_data = self._build_request(question, session_id)
         url = f"{self.base_url}{self.api_endpoint}"
-        request_json = request_data.model_dump()
-
-        logger.debug(f"请求URL: {url}")
-        logger.debug(f"请求参数: {json.dumps(request_json, ensure_ascii=False, indent=2)}")
+        headers = self._build_headers(for_init_session=False)
 
         # 生成trace_id用于跟踪
         trace_id = str(uuid.uuid4())[:8]
-        logger.debug(f"本次请求trace_id: {trace_id}")
 
-        response = None
-        try:
-            logger.debug(f"发送问题: {question[:50]}...")
-            
-            response = await session.post(
-                url,
-                json=request_json,
-                headers={"content-type": "application/json"}
-            )
+        with logger.contextualize(trace_id=trace_id):
+            logger.debug("发送问题", question_preview=question[:50])
 
-            # 检查响应状态
-            if response.status != 200:
-                response_text = await response.text()
-                logger.error(f"❌ [诊断] HTTP请求失败，状态码: {response.status}")
-                logger.error(f"  响应内容: {response_text[:500]}...")
-                
-                # 特别检查 400 错误和 session ID 相关的问题
-                if response.status == 400:
-                    logger.error("=" * 80)
-                    logger.error("🚨 [诊断] 收到 HTTP 400 错误 - 详细诊断信息:")
-                    logger.error("  可能的原因:")
-                    logger.error("    1. session_id 无效或已过期")
-                    logger.error("    2. 认证信息（cookies/headers）无效")
-                    logger.error("    3. 请求参数格式错误")
-                    logger.error(f"  当前使用的 session_id: {self.current_session_id}")
-                    logger.error(f"  会话初始化状态: {self.session_initialized}")
-                    logger.error(f"  HTTP session 对象: {self.session}")
-                    logger.error(f"  HTTP session 是否关闭: {self.session.closed if self.session else 'N/A'}")
-                    logger.error(f"  Token 是否存在: {bool(self.config.current_token)}")
-                    logger.error(f"  Token 更新时间: {self.config.token_updated_at}")
-                    logger.error("=" * 80)
-                
-                raise ValueError(f"HTTP请求失败: {response.status} - {response_text[:200]}")
-
-            # 检查响应类型
-            content_type = response.headers.get('content-type', '')
-            logger.debug(f"响应类型: {content_type}, 状态码: {response.status}")
-
-            if 'text/event-stream' not in content_type:
-                # 读取响应内容进行诊断
-                response_text = await response.text()
-                logger.error(f"意外的响应类型: {content_type}")
-                
-                if not response_text.strip():
-                    logger.error("收到了空的错误响应内容。")
-                    raise ValueError(f"Expected SSE response, got {content_type} with empty body. 可能原因: 1) 认证信息错误 2) 请求参数问题 3) API端点变更")
-
-                logger.error(f"响应内容 (前1000字符): {response_text[:1000]}")
-
-                # 尝试解析JSON错误响应
-                try:
-                    error_data = json.loads(response_text)
-                    error_msg = error_data.get('msg', '未知错误')
-                    error_code = error_data.get('code', 'N/A')
-                    logger.error(f"API错误响应 (code: {error_code}): {error_msg}")
-                    logger.debug(f"完整错误详情: {json.dumps(error_data, ensure_ascii=False, indent=2)}")
-                    raise ValueError(f"API返回错误 (code: {error_code}): {error_msg}")
-                except json.JSONDecodeError:
-                    logger.error("无法将错误响应解析为JSON。")
-                    logger.error(f"原始响应内容: {response_text}")
-                    raise ValueError(f"预期的SSE响应，但收到 {content_type}。响应无法解析为JSON: {response_text[:200]}")
-
-            # 处理流式响应
-            message_count = 0
-            async for message in self._process_sse_stream(
-                response,
-                trace_id=trace_id,
-                attempt_index=0,
-                question=question
-            ):
-                message_count += 1
-                yield message
-
-            # 移除这个日志，因为在 _process_sse_stream 中已经有更详细的统计信息
-
-            # 如果没有收到任何消息，至少返回一个系统消息
-            if message_count == 0:
-                logger.warning("未收到有效SSE消息")
-                yield IMAMessage(
-                    type=MessageType.SYSTEM,
-                    content="未收到有效响应，但请求已成功发送",
-                    raw="No valid SSE messages received"
+            response = None
+            try:
+                response = await session.post(
+                    url,
+                    json=request_data.model_dump(),
+                    headers=headers
                 )
 
-        except asyncio.TimeoutError as e:
-            logger.error(f"请求超时: {e}")
-            raise ValueError(f"请求超时: {str(e)}")
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP请求失败: {e}")
-            raise ValueError(f"HTTP请求失败: {str(e)}")
-        except Exception as e:
-            logger.error(f"询问过程中发生未知错误: {e}")
-            # 重新抛出异常，但包装为更友好的错误信息
-            raise ValueError(f"询问失败: {str(e)}")
-        finally:
-            # 确保响应被正确关闭
-            if response and not response.closed:
-                response.close()
+                # 检查响应状态
+                if response.status != 200:
+                    response_text = await response.text()
+                    logger.error("HTTP请求失败", status=response.status, response=response_text[:500])
+                    raise ValueError(f"HTTP {response.status}: {response_text[:200]}")
+
+                content_type = response.headers.get('content-type', '')
+                if 'text/event-stream' not in content_type:
+                    response_text = await response.text()
+                    try:
+                        error_data = json.loads(response_text)
+                        raise ValueError(f"API错误 (code: {error_data.get('code')}): {error_data.get('msg')}")
+                    except json.JSONDecodeError:
+                        raise ValueError(f"意外响应类型: {content_type}, 内容: {response_text[:200]}")
+
+                # 处理流式响应
+                message_count = 0
+                async for message in self._process_sse_stream(
+                    response,
+                    trace_id=trace_id,
+                    attempt_index=0,
+                    question=question
+                ):
+                    message_count += 1
+                    yield message
+
+                if message_count == 0:
+                    yield IMAMessage(type=MessageType.SYSTEM, content="未收到有效响应", raw="No SSE messages")
+
+            finally:
+                if response and not response.closed:
+                    response.close()
 
     def _is_login_expired_error(self, error_str: str) -> bool:
         """检测是否是登录过期相关错误"""
         login_expired_patterns = [
             "Session initialization failed",
-            "登录过期",
-            "登录失败",
-            "authentication failed",
-            "认证失败",
-            "code: 600001",
-            "code: 600002",
-            "code: 600003",
-            "token expired",
-            "会话已过期",
-            "请重新登录",
-            "unauthorized",
-            "401",
-            "Expected SSE response",  # 服务器返回非SSE响应通常意味着会话/认证失败
+            "登录过期", "登录失败", "authentication failed", "认证失败",
+            "code: 600001", "code: 600002", "code: 600003",
+            "token expired", "会话已过期", "请重新登录", "unauthorized", "401"
         ]
-
         error_lower = error_str.lower()
         return any(pattern.lower() in error_lower for pattern in login_expired_patterns)
 
     async def ask_question_complete(self, question: str, timeout: Optional[float] = None) -> List[IMAMessage]:
-        """获取完整的问题回答 - 支持自动 token 刷新重试"""
-        main_trace_id = str(uuid.uuid4())[:8]
-        logger.info(f"🚀 开始问答 (trace_id={main_trace_id}): {question[:50]}...")
-        
+        """获取完整的问题回答 - 支持自动重试"""
         start_time = time.time()
 
         async def _attempt_request():
-            # 检查总超时
             if timeout and (time.time() - start_time > timeout):
                 raise asyncio.TimeoutError("Total timeout exceeded")
 
             messages = []
-            gen = None
+            # 每次尝试使用新的 session_id 以确保隔离
+            session_id = await self.init_session()
+            
+            gen = self.ask_question(question, session_id=session_id)
             try:
-                # 动态计算剩余超时时间给单次请求
-                step_timeout = None
-                if timeout:
-                    step_timeout = timeout - (time.time() - start_time)
-                    if step_timeout <= 1.0:
-                         raise asyncio.TimeoutError("Time budget exhausted")
-                
-                # 执行请求
-                gen = self.ask_question(question)
-                try:
-                    while True:
-                         current_step_timeout = timeout - (time.time() - start_time) if timeout else None
-                         if current_step_timeout is not None and current_step_timeout <= 0.5:
-                             raise asyncio.TimeoutError("Approaching timeout")
-                         
-                         if current_step_timeout:
-                             msg = await asyncio.wait_for(gen.__anext__(), timeout=current_step_timeout)
-                         else:
-                             msg = await gen.__anext__()
-                         messages.append(msg)
-                except StopAsyncIteration:
-                    pass
-                
-                if not messages:
-                    raise ValueError("未收到有效消息")
-                
-                return messages
-
-            except Exception as e:
-                # 检查是否是认证错误
-                error_str = str(e)
-                if self._is_login_expired_error(error_str):
-                    logger.warning(f"检测到认证错误: {e}")
-                    # 尝试刷新
-                    if await self.refresh_token():
-                        logger.info("Token刷新成功")
-                        # 重置会话状态
-                        if self.session and not self.session.closed:
-                            await self.session.close()
-                            self.session = None
-                        self.session_initialized = False
-                        self.current_session_id = None
-                        # 抛出特定异常，让 tenacity 捕获并重试
-                        raise ValueError("Token refreshed, retry required") from e
-                    else:
-                        logger.error("Token刷新失败")
-                        # 刷新失败，抛出异常
-                        raise 
-                
-                # 其他异常直接抛出
-                raise
+                async for msg in gen:
+                    messages.append(msg)
+                    if timeout and (time.time() - start_time > timeout):
+                        break
             finally:
-                if gen:
-                    await gen.aclose()
+                await gen.aclose()
+            
+            if not messages:
+                raise ValueError("未收到有效消息")
+            return messages
 
         try:
             retryer = AsyncRetrying(
                 stop=stop_after_attempt(self.config.retry_count + 1),
                 wait=wait_exponential(multiplier=1, min=1, max=10),
-                # 重试条件: 网络错误, 超时, 或者我们抛出的 Token refreshed 信号 (ValueError)
                 retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, ValueError)),
                 before_sleep=before_sleep_log(logger, "WARNING"),
                 reraise=True
@@ -1067,13 +921,16 @@ class IMAAPIClient:
             
             async for attempt in retryer:
                 with attempt:
-                    return await _attempt_request()
+                    try:
+                        return await _attempt_request()
+                    except ValueError as e:
+                        if self._is_login_expired_error(str(e)):
+                            logger.info("检测到登录失效，强制刷新 Token 并重试...")
+                            await self.refresh_token()
+                        raise
 
-        except RetryError:
-            logger.error(f"❌ [完整问答] 重试耗尽")
-            return [IMAMessage(type=MessageType.SYSTEM, content="请求失败: 重试次数耗尽", raw="Retry exhausted")]
         except Exception as e:
-            logger.error(f"❌ [完整问答] 失败: {e}")
+            logger.exception("问答失败", question_preview=question[:50])
             return [IMAMessage(type=MessageType.SYSTEM, content=f"请求失败: {e}", raw=str(e))]
 
     def _extract_text_content(self, messages: List[IMAMessage]) -> str:
@@ -1085,7 +942,6 @@ class IMAAPIClient:
 
         for message in messages:
             # 仅提取 TextMessage 且类型为 TEXT 的内容
-            # 过滤掉 SYSTEM (调试信息) 和 KNOWLEDGE_BASE (进度信息) 类型的消息
             if message.type == MessageType.TEXT:
                 if isinstance(message, TextMessage) and message.text:
                     content_parts.append(message.text)

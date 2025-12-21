@@ -21,25 +21,6 @@ class DeviceInfo(BaseModel):
     uskey_bus_infos_input: str
 
 
-class IMARequest(BaseModel):
-    """IMA API 请求模型"""
-    session_id: str
-    robot_type: int
-    question: str
-    question_type: int = 2
-    client_id: str
-    command_info: Dict[str, Any] = Field(default_factory=lambda: {
-        "type": 14,
-        "knowledge_qa_info": {
-            "tags": [],
-            "knowledge_ids": []
-        }
-    })
-    model_info: Dict[str, Any]
-    history_info: Dict[str, Any] = Field(default_factory=dict)
-    device_info: DeviceInfo
-
-
 class IMAMessage(BaseModel):
     """IMA 响应消息模型"""
     type: MessageType
@@ -237,9 +218,6 @@ class IMAStatus(BaseModel):
     session_info: Optional[Dict[str, Any]] = None
 
 
-
-
-
 class KnowledgeQaInfo(BaseModel):
     tags: List[str] = []
     knowledge_ids: List[str] = []
@@ -253,11 +231,6 @@ class CommandInfo(BaseModel):
 class ModelInfo(BaseModel):
     model_type: int
     enable_enhancement: bool
-
-
-class DeviceInfo(BaseModel):
-    uskey: str
-    uskey_bus_infos_input: str
 
 
 class HistoryInfo(BaseModel):
@@ -275,18 +248,3 @@ class AskQuestionRequest(BaseModel):
     model_info: ModelInfo
     history_info: HistoryInfo
     device_info: DeviceInfo
-
-
-class SearchStocksArgs(BaseModel):
-    """股票搜索工具参数"""
-    query: str = Field(..., description="股票搜索关键词")
-    limit: int = Field(10, ge=1, le=50, description="返回结果数量")
-
-
-class GetRecommendationsArgs(BaseModel):
-    """获取投资推荐参数"""
-    sector: Optional[str] = Field(None, description="行业或板块过滤条件")
-    time_range: Optional[str] = Field(None, description="时间范围过滤条件")
-    limit: int = Field(20, ge=1, le=100, description="推荐数量")
-
-

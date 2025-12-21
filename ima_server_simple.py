@@ -34,7 +34,7 @@ logger.remove()  # 移除默认的 sink
 logger.add(
     sys.stderr,
     level="INFO",
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level> | <magenta>{extra}</magenta>"
 )
 logger.add(
     log_file,
@@ -42,7 +42,7 @@ logger.add(
     rotation="10 MB",
     retention="1 week",
     encoding="utf-8",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message} | {extra}"
 )
 
 logger.info(f"调试日志已启用，日志文件: {log_file}")
@@ -53,6 +53,16 @@ mcp = FastMCP("IMA Copilot")
 # 全局变量
 ima_client: IMAAPIClient = None
 _token_refreshed: bool = False  # 标记 token 是否已刷新
+
+
+@mcp.on_shutdown()
+async def on_shutdown():
+    """服务器关闭时的清理工作"""
+    global ima_client
+    if ima_client:
+        logger.info("👋 正在关闭 IMA 客户端会话...")
+        await ima_client.close()
+        logger.info("✅ 客户端会话已关闭")
 
 
 async def ensure_client_ready():
@@ -76,7 +86,7 @@ async def ensure_client_ready():
             ima_client = IMAAPIClient(config)
             logger.debug("✅ IMA 客户端初始化成功")
         except Exception as e:
-            logger.error(f"❌ IMA 客户端初始化失败: {e}")
+            logger.exception("❌ IMA 客户端初始化失败")
             return False
     
     # 如果还没刷新过 token，提前刷新一次（添加超时保护）
@@ -84,10 +94,10 @@ async def ensure_client_ready():
         logger.info("🔄 验证 token...")
         try:
             import asyncio
-            # 为token刷新也添加超时保护（10秒应该足够）
+            # 为token刷新也添加超时保护（15秒）
             token_valid = await asyncio.wait_for(
                 ima_client.ensure_valid_token(),
-                timeout=10.0
+                timeout=15.0
             )
             
             if token_valid:
@@ -95,13 +105,15 @@ async def ensure_client_ready():
                 logger.info("✅ Token 验证成功")
                 return True
             else:
-                logger.warning("⚠️ Token 验证失败")
-                return False
+                logger.warning("⚠️ Token 验证失败，尝试继续...")
+                # 即使刷新失败也标记为 True，让后续请求在 ask_question 内部触发自动重试逻辑
+                _token_refreshed = True 
+                return True
         except asyncio.TimeoutError:
             logger.error("❌ Token 验证超时")
             return False
         except Exception as e:
-            logger.error(f"❌ Token 验证异常: {e}")
+            logger.exception("❌ Token 验证异常")
             return False
     
     return True
@@ -118,91 +130,103 @@ async def ask(question: str) -> list[TextContent]:
         IMA 知识库的回答
     """
     global ima_client
+    
+    # 生成请求ID用于日志追踪
+    import uuid
+    request_id = str(uuid.uuid4())[:8]
+    
+    # 绑定上下文
+    with logger.contextualize(request_id=request_id):
+        # 确保客户端已初始化并且 token 有效
+        if not await ensure_client_ready():
+            return [TextContent(type="text", text="[ERROR] IMA 客户端初始化或 token 刷新失败，请检查配置")]
 
-    # 确保客户端已初始化并且 token 有效
-    if not await ensure_client_ready():
-        return [TextContent(type="text", text="[ERROR] IMA 客户端初始化或 token 刷新失败，请检查配置")]
+        logger.debug("🔍 ask 工具调用", question_preview=question[:50])
 
-    logger.debug(f"🔍 ask 工具: {question[:50]}...")
+        if not question or not question.strip():
+            return [TextContent(type="text", text="[ERROR] 问题不能为空")]
 
-    if not question or not question.strip():
-        return [TextContent(type="text", text="[ERROR] 问题不能为空")]
-
-    try:
-        logger.debug(f"发送问题: {question[:50]}...")
-
-        # 增加超时时间以支持长回复
-        # 注意：某些 MCP 客户端（如 Claude Desktop）可能有自己的 60秒超时限制
-        mcp_safe_timeout = 300
-        
-        # 将超时控制传递给 ask_question_complete，以便在超时时返回部分结果
-        messages = await ima_client.ask_question_complete(question, timeout=mcp_safe_timeout)
-        
-        # 即使没有消息，也会返回包含错误信息的消息列表
-        if not messages:
-            logger.warning("⚠️ 未收到响应")
-            return [TextContent(type="text", text="[ERROR] 没有收到任何响应，或者请求超时未产生任何输出")]
-
-        # 打印完整的qa结果
-        logger.info("-" * 80)
-        logger.info("完整 QA 结果 (原始消息列表):")
-        for i, msg in enumerate(messages):
-            logger.info(f"  消息 {i + 1} (类型: {msg.type.value}): {msg.content[:200]}...")
-        logger.info("-" * 80)
-
-        response = ima_client._extract_text_content(messages)
-        logger.debug(f"✅ 获取响应 (长度: {len(response)})")
-        
-        content_list = [TextContent(type="text", text=response)]
-
-        # 提取并添加参考资料信息
         try:
-            knowledge_info = ima_client._extract_knowledge_info(messages)
-            if knowledge_info:
-                ref_text = "### 📚 参考资料\n\n"
-                for i, item in enumerate(knowledge_info, 1):
-                    title = item.get('title', '未知标题')
-                    intro = item.get('introduction', '')
-                    # 截断过长的简介
-                    if intro and len(intro) > 150:
-                        intro = intro[:150] + "..."
-                    
-                    ref_text += f"{i}. **{title}**\n"
-                    if intro:
-                        ref_text += f"   > {intro}\n"
-                    ref_text += "\n"
-                
-                content_list.append(TextContent(type="text", text=ref_text))
-                logger.debug(f"✅ 添加参考资料 (数量: {len(knowledge_info)})")
-        except Exception as e:
-            logger.warning(f"提取参考资料失败: {e}")
+            logger.debug("发送问题", length=len(question))
 
-        # 打印返回 ask 的内容
-        logger.info("-" * 80)
-        logger.info(f"ask 工具返回内容 (Block 数量: {len(content_list)}):")
-        for i, block in enumerate(content_list):
-             logger.info(f"Block {i+1} ({len(block.text)} chars):\n{block.text[:200]}...")
-        logger.info("-" * 80)
-        
-        return content_list
+            # 增加超时时间以支持长回复
+            # 注意：某些 MCP 客户端（如 Claude Desktop）可能有自己的 60秒超时限制
+            mcp_safe_timeout = 300
             
-    except Exception as e:
-        logger.error(f"询问 IMA 时发生错误: {e}")
-        import traceback
-        logger.error(f"堆栈跟踪:\n{traceback.format_exc()}")
-        
-        # 返回更友好的错误信息
-        if "超时" in str(e) or "timeout" in str(e).lower():
-            return [TextContent(type="text", text="[ERROR] 请求超时，请稍后重试")]
-        elif "认证" in str(e) or "auth" in str(e).lower():
-            return [TextContent(type="text", text="[ERROR] 认证失败，请检查 IMA 配置信息")]
-        elif "网络" in str(e) or "network" in str(e).lower() or "connection" in str(e).lower():
-            return [TextContent(type="text", text="[ERROR] 网络连接失败，请检查网络设置")]
-        else:
-            return [TextContent(type="text", text=f"[ERROR] 询问失败: {str(e)}")]
+            # 将超时控制传递给 ask_question_complete，以便在超时时返回部分结果
+            messages = await ima_client.ask_question_complete(question, timeout=mcp_safe_timeout)
+            
+            # 即使没有消息，也会返回包含错误信息的消息列表
+            if not messages:
+                logger.warning("⚠️ 未收到响应")
+                return [TextContent(type="text", text="[ERROR] 没有收到任何响应，或者请求超时未产生任何输出")]
 
+            # 打印完整的qa结果
+            logger.info("-" * 80)
+            logger.info("完整 QA 结果 (原始消息列表):")
+            for i, msg in enumerate(messages):
+                logger.info(f"  消息 {i + 1} (类型: {msg.type.value}): {msg.content[:200]}...")
+            logger.info("-" * 80)
 
+            response = ima_client._extract_text_content(messages)
+            
+            # 如果没有提取到文本内容，检查是否有系统错误消息
+            if not response:
+                error_msgs = [msg.content for msg in messages if msg.type == 'system']
+                if error_msgs:
+                    response = f"[ERROR] {'; '.join(error_msgs)}"
+                    logger.warning("⚠️ 未提取到文本，返回系统错误", error=response)
+                else:
+                    response = "没有收到有效回复"
+                    
+            logger.debug("✅ 获取响应", length=len(response))
+            
+            content_list = [TextContent(type="text", text=response)]
 
+            # 提取并添加参考资料信息
+            try:
+                knowledge_info = ima_client._extract_knowledge_info(messages)
+                if knowledge_info:
+                    ref_text = "### 📚 参考资料\n\n"
+                    for i, item in enumerate(knowledge_info, 1):
+                        title = item.get('title', '未知标题')
+                        intro = item.get('introduction', '')
+                        # 截断过长的简介
+                        if intro and len(intro) > 150:
+                            intro = intro[:150] + "..."
+                        
+                        ref_text += f"{i}. **{title}**\n"
+                        if intro:
+                            ref_text += f"   > {intro}\n"
+                        ref_text += "\n"
+                    
+                    content_list.append(TextContent(type="text", text=ref_text))
+                    logger.debug("✅ 添加参考资料", count=len(knowledge_info))
+            except Exception as e:
+                logger.warning(f"提取参考资料失败: {e}")
+
+            # 打印返回 ask 的内容
+            logger.info("-" * 80)
+            logger.info(f"ask 工具返回内容 (Block 数量: {len(content_list)}):")
+            for i, block in enumerate(content_list):
+                 logger.info(f"Block {i+1} ({len(block.text)} chars):\n{block.text[:200]}...")
+            logger.info("-" * 80)
+            
+            return content_list
+                
+        except Exception as e:
+            logger.exception("询问 IMA 时发生错误")
+            
+            # 返回更友好的错误信息
+            error_str = str(e).lower()
+            if "超时" in str(e) or "timeout" in error_str:
+                return [TextContent(type="text", text="[ERROR] 请求超时，请稍后重试")]
+            elif "认证" in str(e) or "auth" in error_str:
+                return [TextContent(type="text", text="[ERROR] 认证失败，请检查 IMA 配置信息")]
+            elif "网络" in str(e) or "network" in error_str or "connection" in error_str:
+                return [TextContent(type="text", text="[ERROR] 网络连接失败，请检查网络设置")]
+            else:
+                return [TextContent(type="text", text=f"[ERROR] 询问失败: {str(e)}")]
 
 
 @mcp.resource("ima://config")
@@ -268,9 +292,6 @@ python ima_server_simple.py
 使用 MCP Inspector 连接到: http://127.0.0.1:8081/mcp
 """
     return help_text
-
-
-
 
 
 def main():
