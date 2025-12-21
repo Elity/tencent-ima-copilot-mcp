@@ -55,14 +55,14 @@ ima_client: IMAAPIClient = None
 _token_refreshed: bool = False  # 标记 token 是否已刷新
 
 
-@mcp.on_shutdown()
-async def on_shutdown():
-    """服务器关闭时的清理工作"""
-    global ima_client
-    if ima_client:
-        logger.info("👋 正在关闭 IMA 客户端会话...")
-        await ima_client.close()
-        logger.info("✅ 客户端会话已关闭")
+# @mcp.on_shutdown()
+# async def on_shutdown():
+#     """服务器关闭时的清理工作"""
+#     global ima_client
+#     if ima_client:
+#         logger.info("👋 正在关闭 IMA 客户端会话...")
+#         await ima_client.close()
+#         logger.info("✅ 客户端会话已关闭")
 
 
 async def ensure_client_ready():
