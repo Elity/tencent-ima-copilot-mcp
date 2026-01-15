@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, HttpUrl, field_serializer
+from pydantic import BaseModel, Field, HttpUrl, field_serializer, ConfigDict
 from enum import Enum
 
 
@@ -103,8 +103,9 @@ class TokenRefreshResponse(BaseModel):
 # --- init_session Models ---
 
 class KnowledgeBaseInfoWithFolder(BaseModel):
-    knowledge_base_id: str
-    folder_ids: List[str] = []
+    model_config = ConfigDict(populate_by_name=True)
+    knowledge_base_id: str = Field(..., alias="knowledgeBaseId")
+    folder_ids: List[str] = Field(default_factory=list, alias="folderIds")
 
 
 class EnvInfo(BaseModel):
@@ -114,7 +115,7 @@ class EnvInfo(BaseModel):
 
 class InitSessionRequest(BaseModel):
     envInfo: EnvInfo
-    byKeyword: str
+    byKeyword: Optional[str] = None
     relatedUrl: str
     sceneType: int
     msgsLimit: int = 10

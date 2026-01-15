@@ -340,8 +340,8 @@ class IMAAPIClient:
             "extension_version": "999.999.999",
             "x-ima-bkn": self.config.x_ima_bkn,
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-            "accept": "application/json" if for_init_session else "text/event-stream",
-            "content-type": "application/json",
+            "accept": "application/json" if for_init_session else "*/*",
+            "content-type": "application/json" if for_init_session else "text/event-stream",
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
             "referer": "https://ima.qq.com/wikis",
         }
@@ -768,11 +768,10 @@ class IMAAPIClient:
                 robotType=5,
                 interactType=0
             ),
-            byKeyword=kb_id,
             relatedUrl=kb_id,
             sceneType=1,
-            msgsLimit=0,
-            forbidAutoAddToHistoryList=True,
+            msgsLimit=10,
+            forbidAutoAddToHistoryList=False,
             knowledgeBaseInfoWithFolder=KnowledgeBaseInfoWithFolder(
                 knowledge_base_id=kb_id,
                 folder_ids=[]
@@ -780,7 +779,7 @@ class IMAAPIClient:
         )
         
         url = f"{self.base_url}{self.init_session_endpoint}"
-        request_json = init_request.model_dump()
+        request_json = init_request.model_dump(by_alias=True, exclude_none=True)
         headers = self._build_headers(for_init_session=True)
 
         try:

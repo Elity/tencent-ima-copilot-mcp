@@ -177,3 +177,5 @@ logs/
 
 .claude
 .spec-workflow
+.ace-tool/
+.ruff_cache
