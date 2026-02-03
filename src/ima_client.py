@@ -5,6 +5,7 @@ import asyncio
 import base64
 import codecs
 import json
+import os
 import random
 import re
 import secrets
@@ -15,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 
 import aiohttp
 from loguru import logger
@@ -56,6 +57,12 @@ from models import (
 
 class IMAAPIClient:
     """IMA API 客户端"""
+    
+    # Session 最大空闲时间（秒），超过后自动重建以防止连接泄漏
+    SESSION_MAX_IDLE_SECONDS = 30 * 60  # 30 分钟
+    
+    # .env 文件路径（用于回写 token）
+    ENV_FILE_PATH = Path(__file__).parent.parent / ".env"
 
     def __init__(self, config: IMAConfig):
         self.config = config
@@ -66,6 +73,9 @@ class IMAAPIClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.raw_log_dir: Optional[Path] = None
         self._token_lock = asyncio.Lock()  # 保护 token 刷新过程
+        self._session_created_at: Optional[float] = None  # Session 创建时间戳
+        self._session_lock = asyncio.Lock()  # 保护 Session 创建/销毁过程
+        self._env_write_lock = asyncio.Lock()  # 保护 .env 文件写入
 
         if getattr(self.config, "enable_raw_logging", False):
             raw_dir_value = getattr(self.config, "raw_log_dir", None)
@@ -74,8 +84,129 @@ class IMAAPIClient:
                 raw_dir.mkdir(parents=True, exist_ok=True)
                 self.raw_log_dir = raw_dir
                 logger.info(f"Raw SSE logs will be written to: {raw_dir}")
+                # 防御性：启动时清理超过24小时的旧日志文件
+                self._cleanup_old_raw_logs(max_age_hours=24)
             except Exception as exc:
                 logger.error(f"Failed to prepare raw SSE log directory: {exc}")
+
+    def _cleanup_old_raw_logs(self, max_age_hours: int = 24) -> None:
+        """清理超过指定时间的旧日志文件，防止磁盘空间无限增长"""
+        if not self.raw_log_dir:
+            return
+        try:
+            cutoff = datetime.now() - timedelta(hours=max_age_hours)
+            cleaned_count = 0
+            for f in self.raw_log_dir.glob("*.log"):
+                try:
+                    if datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
+                        f.unlink()
+                        cleaned_count += 1
+                except Exception:
+                    pass  # 忽略单个文件删除失败
+            if cleaned_count > 0:
+                logger.info(f"🧹 清理了 {cleaned_count} 个超过 {max_age_hours} 小时的旧日志文件")
+        except Exception as e:
+            logger.warning(f"清理旧日志文件时发生错误: {e}")
+
+    async def _update_env_file(self, updates: Dict[str, str]) -> bool:
+        """
+        安全地更新 .env 文件中的指定字段，不影响其他配置
+        
+        Args:
+            updates: 要更新的键值对，例如 {"IMA_X_IMA_COOKIE": "new_value"}
+            
+        Returns:
+            bool: 更新是否成功
+        """
+        async with self._env_write_lock:
+            try:
+                env_path = self.ENV_FILE_PATH
+                
+                # 检查 .env 文件是否存在
+                if not env_path.exists():
+                    logger.warning(f"⚠️ .env 文件不存在: {env_path}，跳过回写")
+                    return False
+                
+                # 读取现有内容
+                content = env_path.read_text(encoding="utf-8")
+                lines = content.splitlines(keepends=True)
+                
+                # 跟踪已更新的键
+                updated_keys = set()
+                new_lines = []
+                
+                for line in lines:
+                    stripped = line.strip()
+                    
+                    # 跳过空行和注释
+                    if not stripped or stripped.startswith('#'):
+                        new_lines.append(line)
+                        continue
+                    
+                    # 解析键值对
+                    if '=' in stripped:
+                        key = stripped.split('=', 1)[0].strip()
+                        
+                        if key in updates:
+                            # 替换该行的值
+                            new_value = updates[key]
+                            # 保持原有的换行符
+                            line_ending = '\n' if line.endswith('\n') else ''
+                            # 如果值包含特殊字符，用引号包裹
+                            if any(c in new_value for c in [' ', '"', "'", '\n', '\r', '\t', ';', '#']):
+                                new_value = f'"{new_value}"'
+                            new_lines.append(f"{key}={new_value}{line_ending}")
+                            updated_keys.add(key)
+                            logger.debug(f"📝 更新 .env 中的 {key}")
+                        else:
+                            new_lines.append(line)
+                    else:
+                        new_lines.append(line)
+                
+                # 添加未找到的新键（追加到文件末尾）
+                for key, value in updates.items():
+                    if key not in updated_keys:
+                        if any(c in value for c in [' ', '"', "'", '\n', '\r', '\t', ';', '#']):
+                            value = f'"{value}"'
+                        new_lines.append(f"\n{key}={value}\n")
+                        logger.debug(f"📝 添加 .env 中的新键 {key}")
+                
+                # 写回文件
+                env_path.write_text(''.join(new_lines), encoding="utf-8")
+                
+                logger.info(f"✅ .env 文件已更新，更新了 {len(updates)} 个字段")
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ 更新 .env 文件失败: {e}\n{traceback.format_exc()}")
+                return False
+
+    def _update_x_ima_cookie_with_token(self, x_ima_cookie: str, new_token: str) -> str:
+        """
+        在 x_ima_cookie 字符串中更新 IMA-TOKEN 的值
+        
+        Args:
+            x_ima_cookie: 原始的 x_ima_cookie 字符串
+            new_token: 新的 token 值
+            
+        Returns:
+            更新后的 x_ima_cookie 字符串
+        """
+        # URL 编码 token（cookie 中通常需要编码）
+        encoded_token = quote(new_token, safe='')
+        
+        if 'IMA-TOKEN=' in x_ima_cookie:
+            # 替换现有的 IMA-TOKEN
+            updated = re.sub(
+                r'IMA-TOKEN=[^;]*',
+                f'IMA-TOKEN={encoded_token}',
+                x_ima_cookie
+            )
+        else:
+            # 追加 IMA-TOKEN
+            updated = x_ima_cookie.rstrip('; ') + f'; IMA-TOKEN={encoded_token}'
+        
+        return updated
 
     def _should_persist_raw(self, stream_error: Optional[str]) -> bool:
         """判断当前是否需要保存原始SSE响应"""
@@ -274,12 +405,16 @@ class IMAAPIClient:
                             refresh_response = TokenRefreshResponse(**response_data)
 
                             if refresh_response.code == 0 and refresh_response.token:
-                                # 更新token信息
+                                # 更新token信息（内存）
                                 self.config.current_token = refresh_response.token
                                 self.config.token_valid_time = int(refresh_response.token_valid_time or "7200")
                                 self.config.token_updated_at = datetime.now()
 
                                 logger.info(f"✅ Token刷新成功 (有效期: {self.config.token_valid_time}秒)")
+                                
+                                # 回写到 .env 文件（持久化）
+                                await self._persist_token_to_env(refresh_response.token)
+                                
                                 return True
                             else:
                                 logger.warning("=" * 60)
@@ -297,6 +432,36 @@ class IMAAPIClient:
             except Exception as e:
                 logger.error(f"Token刷新异常: {type(e).__name__}: {e}")
                 return False
+
+    async def _persist_token_to_env(self, new_token: str) -> None:
+        """
+        将刷新后的 token 持久化到 .env 文件
+        
+        更新 IMA_X_IMA_COOKIE 中的 IMA-TOKEN 部分，不影响其他字段
+        """
+        try:
+            # 更新 x_ima_cookie 中的 IMA-TOKEN
+            updated_x_ima_cookie = self._update_x_ima_cookie_with_token(
+                self.config.x_ima_cookie, 
+                new_token
+            )
+            
+            # 同时更新内存中的原始配置（这样下次构建请求头时使用的是最新值）
+            self.config.x_ima_cookie = updated_x_ima_cookie
+            
+            # 回写到 .env 文件
+            success = await self._update_env_file({
+                "IMA_X_IMA_COOKIE": updated_x_ima_cookie
+            })
+            
+            if success:
+                logger.info("💾 Token 已持久化到 .env 文件")
+            else:
+                logger.warning("⚠️ Token 回写 .env 失败，仅在内存中更新")
+                
+        except Exception as e:
+            logger.error(f"❌ 持久化 Token 到 .env 时发生错误: {e}")
+            # 不抛出异常，因为内存中的 token 已经更新，服务仍可正常运行
 
     async def ensure_valid_token(self) -> bool:
         """确保token有效，如果过期则刷新"""
@@ -339,61 +504,88 @@ class IMAAPIClient:
             "from_browser_ima": "1",
             "extension_version": "999.999.999",
             "x-ima-bkn": self.config.x_ima_bkn,
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
             "accept": "application/json" if for_init_session else "*/*",
-            "content-type": "application/json" if for_init_session else "text/event-stream",
-            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "content-type": "application/json",
+            "accept-language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+            "cache-control": "no-cache",
+            "pragma": "no-cache",
             "referer": "https://ima.qq.com/wikis",
         }
-
-        if self.config.current_token:
-            headers["authorization"] = f"Bearer {self.config.current_token}"
+        
+        # 注意：不要添加 authorization 头，token 已经在 x-ima-cookie 中了
+        # 同时使用两种方式可能导致服务器拒绝响应
         
         return headers
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=5),
-        retry=retry_if_exception_type((aiohttp.ClientError, OSError)),
-        before_sleep=before_sleep_log(logger, "WARNING"),
-        reraise=True
-    )
     async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建 HTTP 会话"""
-        if self.session is None or self.session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=100,
-                limit_per_host=30,
-                ttl_dns_cache=300,
-                use_dns_cache=True,
-                keepalive_timeout=60,
-            )
-
-            sse_timeout = 600  # 增加总超时到 10 分钟以支持极长回复
+        """获取或创建 HTTP 会话，支持空闲超时自动重建"""
+        async with self._session_lock:
+            current_time = time.time()
             
-            timeout = aiohttp.ClientTimeout(
-                total=sse_timeout,
-                sock_read=180,
-                connect=30,
-                sock_connect=30,
+            # 检查是否需要重建 Session（空闲超时或已关闭）
+            should_rebuild = (
+                self.session is None or 
+                self.session.closed or
+                (self._session_created_at and 
+                 current_time - self._session_created_at > self.SESSION_MAX_IDLE_SECONDS)
             )
             
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                cookies=self._parse_cookies(self.config.cookies or ""),
-                # 注意：不在 session 层面固定 headers，因为 token 可能会变
-                trust_env=True,
-                read_bufsize=5 * 2**20,
-                auto_decompress=True,
-            )
+            if should_rebuild:
+                # 先关闭旧的 Session
+                if self.session and not self.session.closed:
+                    logger.info("🔄 Session 空闲超时，正在重建...")
+                    try:
+                        await self.session.close()
+                    except Exception as e:
+                        logger.warning(f"关闭旧 Session 时发生错误: {e}")
+                    self.session = None
+                
+                # 优化连接池配置，减少内存占用
+                connector = aiohttp.TCPConnector(
+                    limit=20,              # 减少最大并发连接数（原100）
+                    limit_per_host=10,     # 减少每主机连接数（原30）
+                    ttl_dns_cache=300,
+                    use_dns_cache=True,
+                    keepalive_timeout=30,  # 减少保活时间（原60）
+                    force_close=False,     # 允许连接复用，但配合较短的 keepalive
+                    enable_cleanup_closed=True,  # 启用关闭连接清理
+                )
 
-        return self.session
+                sse_timeout = 600  # 10 分钟总超时以支持极长回复
+                
+                timeout = aiohttp.ClientTimeout(
+                    total=sse_timeout,
+                    sock_read=180,
+                    connect=30,
+                    sock_connect=30,
+                )
+                
+                self.session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    cookies=self._parse_cookies(self.config.cookies or ""),
+                    trust_env=True,
+                    read_bufsize=1 * 2**20,  # 减少读取缓冲区（原5MB→1MB）
+                    auto_decompress=True,
+                )
+                self._session_created_at = current_time
+                logger.debug(f"✅ 新 HTTP Session 已创建")
+
+            return self.session
 
     async def close(self):
-        """关闭客户端会话"""
-        if self.session and not self.session.closed:
-            await self.session.close()
+        """关闭客户端会话并释放所有资源"""
+        async with self._session_lock:
+            if self.session and not self.session.closed:
+                try:
+                    await self.session.close()
+                    logger.debug("HTTP Session 已关闭")
+                except Exception as e:
+                    logger.warning(f"关闭 HTTP Session 时发生错误: {e}")
+                finally:
+                    self.session = None
+                    self._session_created_at = None
 
     def _generate_session_id(self) -> str:
         """生成会话 ID"""
@@ -523,62 +715,105 @@ class IMAAPIClient:
         parsed_message_count = 0
         failed_parse_count = 0
         initial_timeout = 180
-        chunk_timeout = 120
+        # 防御性：full_response 最大缓冲区大小（5MB），防止内存无限增长
+        MAX_FULL_RESPONSE_SIZE = 5 * 1024 * 1024
+        chunk_timeout = 10  # 如果 10 秒内没有新数据块，认为流已结束
         last_data_time = asyncio.get_event_loop().time()
         start_time = asyncio.get_event_loop().time()
         has_received_data = False
         sample_chunks = []
         stream_error: Optional[str] = None
+        last_chunk_time = start_time
+        no_data_timeout = 5  # 5 秒内没有新数据块则认为流结束
         
         # 使用增量解码器处理可能被截断的多字节字符
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         try:
             logger.debug(f"🔄 [SSE流] 开始读取 (trace_id={trace_id})")
-            logger.debug(f"  手动超时配置: initial={initial_timeout}s, chunk={chunk_timeout}s")
             
-            async for chunk in response.content:
-                current_time = asyncio.get_event_loop().time()
+            chunk_iter_count = 0
+            
+            # 使用迭代器以便可以手动控制超时
+            content_iter = response.content.__aiter__()
+            
+            while True:
+                try:
+                    # 使用超时读取下一个chunk
+                    timeout_duration = initial_timeout if not has_received_data else chunk_timeout
+                    chunk = await asyncio.wait_for(
+                        content_iter.__anext__(), 
+                        timeout=timeout_duration
+                    )
+                    
+                    chunk_iter_count += 1
+                    current_time = asyncio.get_event_loop().time()
+                    last_chunk_time = current_time
 
-                timeout_threshold = chunk_timeout if has_received_data else initial_timeout
-                elapsed_since_last_data = current_time - last_data_time
+                    if chunk:
+                        has_received_data = True
+                        last_data_time = current_time
+                        message_count += 1
+
+                        # 使用增量解码器解码
+                        try:
+                            chunk_str = decoder.decode(chunk, final=False)
+                        except Exception as e:
+                            logger.error(f"❌ [SSE流] 解码失败: {e}")
+                            continue
+
+                        buffer += chunk_str
+                        # 防御性：限制 full_response 大小以防止内存无限增长
+                        if len(full_response) < MAX_FULL_RESPONSE_SIZE:
+                            full_response += chunk_str
+
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line = line.strip()
+                            if line:
+                                # 检查是否是结束标记
+                                if line == '[DONE]' or line == 'data: [DONE]':
+                                    logger.debug(f"🏁 [SSE流] 收到结束标记")
+                                    return  # 结束生成器
+                                
+                                try:
+                                    message = self._parse_sse_message(line)
+                                    if message:
+                                        parsed_message_count += 1
+                                        yield message
+                                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                                    failed_parse_count += 1
                 
-                # 手动超时检查（通常不会触发，因为aiohttp的timeout会先触发）
-                if elapsed_since_last_data > timeout_threshold:
-                    stream_error = f"Manual timeout after {elapsed_since_last_data:.1f}s with {message_count} chunks"
-                    logger.warning(f"⏰ [SSE流] 手动超时触发: {stream_error}")
+                except StopAsyncIteration:
+                    # 流正常结束
+                    logger.debug(f"✅ [SSE流] 流正常结束")
                     break
-
-                if chunk:
-                    has_received_data = True
-                    last_data_time = current_time
-                    message_count += 1
-
-                    # 使用增量解码器解码
-                    chunk_str = decoder.decode(chunk, final=False)
-
-                    buffer += chunk_str
-                    full_response += chunk_str
-
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        line = line.strip()
-                        if line:
-                            try:
-                                message = self._parse_sse_message(line)
-                                if message:
-                                    parsed_message_count += 1
-                                    yield message
-                            except (json.JSONDecodeError, KeyError, ValueError):
-                                failed_parse_count += 1
-
+                except asyncio.TimeoutError:
+                    # 超时，认为流已结束
+                    if has_received_data and parsed_message_count > 0:
+                        logger.debug(f"⏱️ [SSE流] 超时，已接收 {parsed_message_count} 条消息")
+                        stream_error = None
+                        break
+                    else:
+                        stream_error = "SSE timeout - no data received"
+                        logger.error(f"❌ [SSE流] 超时错误（未收到数据）")
+                        break
+                    break
+                except asyncio.TimeoutError:
+                    # 超时，认为流已结束
+                    if has_received_data and parsed_message_count > 0:
+                        logger.info(f"⏱️ [SSE流] 读取超时，认为流已自然结束")
+                        logger.info(f"   已接收 {message_count} 个数据块，解析 {parsed_message_count} 条消息")
+                        stream_error = None
+                        break
+                    else:
+                        stream_error = "SSE timeout - no data received"
+                        logger.error(f"❌ [SSE流] 超时错误（未收到数据）")
+                        break
 
         except asyncio.TimeoutError:
-            if has_received_data and parsed_message_count > 0:
-                stream_error = None
-            else:
-                stream_error = "SSE timeout"
-                logger.error(f"❌ [SSE流] 超时错误（未收到数据）, trace_id={trace_id}")
+            # 这个异常已经在上面的 while 循环中处理了
+            pass
         except aiohttp.ClientPayloadError as exc:
             stream_error = f"SSE payload error: {exc}"
             logger.error(f"❌ [SSE流] ClientPayloadError: {exc}, trace_id={trace_id}")
@@ -818,7 +1053,6 @@ class IMAAPIClient:
 
         # 如果没有提供 session_id，则动态初始化一个新会话（实现无状态/单次对话隔离）
         if not session_id:
-            logger.debug("🔄 未提供 session_id，初始化临时会话...")
             session_id = await self.init_session()
 
         session = await self._get_session()
@@ -887,6 +1121,8 @@ class IMAAPIClient:
     async def ask_question_complete(self, question: str, timeout: Optional[float] = None) -> List[IMAMessage]:
         """获取完整的问题回答 - 支持自动重试"""
         start_time = time.time()
+        # 防御性：消息列表最大数量上限，防止内存无限增长
+        MAX_MESSAGES = 10000
 
         async def _attempt_request():
             if timeout and (time.time() - start_time > timeout):
@@ -900,7 +1136,12 @@ class IMAAPIClient:
             try:
                 async for msg in gen:
                     messages.append(msg)
+                    # 防御性：限制消息数量
+                    if len(messages) >= MAX_MESSAGES:
+                        logger.warning(f"⚠️ 消息数量达到上限 {MAX_MESSAGES}，停止接收")
+                        break
                     if timeout and (time.time() - start_time > timeout):
+                        logger.warning(f"⏰ 请求超时，已接收 {len(messages)} 条消息")
                         break
             finally:
                 await gen.aclose()

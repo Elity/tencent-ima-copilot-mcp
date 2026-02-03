@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   ima-mcp-server:
-    image: highkay/tencent-ima-copilot-mcp:latest
+    image: fightingchen/tencent-ima-copilot-mcp:latest
     container_name: ima-copilot-mcp
     restart: unless-stopped
 
@@ -42,13 +42,13 @@ services:
     volumes:
       - ./logs:/app/logs
 
-    # Health check
+    # Health check - 使用 TCP 端口检查（MCP SSE 端点不适合 HTTP GET）
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081').read()"]
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost', 8081)); s.close()"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 30s
 
     # Resource limits (optional, adjust as needed)
     deploy:

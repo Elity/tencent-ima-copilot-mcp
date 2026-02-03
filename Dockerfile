@@ -50,9 +50,11 @@ EXPOSE 8081
 # Create logs directory
 RUN mkdir -p /app/logs/debug/raw
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081').read()" || exit 1
+# Health check - 检查 MCP 端口是否在监听
+# 注意: FastMCP HTTP 传输的 /mcp 端点是 SSE 流，不能用普通 HTTP GET 检查
+# 改用 TCP 端口检查更可靠
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost', 8081)); s.close()" || exit 1
 
 # Run the MCP server
 CMD ["fastmcp", "run", "ima_server_simple.py:mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8081"]

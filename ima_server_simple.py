@@ -25,9 +25,8 @@ app_config = get_app_config()
 log_dir = Path("logs/debug")
 log_dir.mkdir(parents=True, exist_ok=True)
 
-# 生成带时间戳的日志文件
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file = log_dir / f"ima_server_{timestamp}.log"
+# 使用固定日志文件名（避免每次启动创建新文件导致累积）
+log_file = log_dir / "ima_server.log"
 
 # 配置 loguru
 logger.remove()  # 移除默认的 sink
@@ -55,14 +54,31 @@ ima_client: IMAAPIClient = None
 _token_refreshed: bool = False  # 标记 token 是否已刷新
 
 
-# @mcp.on_shutdown()
-# async def on_shutdown():
-#     """服务器关闭时的清理工作"""
-#     global ima_client
-#     if ima_client:
-#         logger.info("👋 正在关闭 IMA 客户端会话...")
-#         await ima_client.close()
-#         logger.info("✅ 客户端会话已关闭")
+async def cleanup_client():
+    """清理客户端资源"""
+    global ima_client
+    if ima_client:
+        try:
+            logger.info("👋 正在关闭 IMA 客户端会话...")
+            await ima_client.close()
+            logger.info("✅ 客户端会话已关闭")
+        except Exception as e:
+            logger.error(f"关闭客户端会话时发生错误: {e}")
+        finally:
+            ima_client = None
+
+
+# 使用 atexit 注册同步清理（作为备用）
+import atexit
+def _sync_cleanup():
+    """同步清理（atexit 回调）"""
+    global ima_client
+    if ima_client and ima_client.session and not ima_client.session.closed:
+        logger.warning("⚠️ 通过 atexit 强制关闭未清理的会话")
+        # 注意：atexit 中无法运行 async 代码，只能标记
+        ima_client = None
+
+atexit.register(_sync_cleanup)
 
 
 async def ensure_client_ready():
@@ -149,12 +165,27 @@ async def ask(question: str) -> list[TextContent]:
         try:
             logger.debug("发送问题", length=len(question))
 
-            # 增加超时时间以支持长回复
-            # 注意：某些 MCP 客户端（如 Claude Desktop）可能有自己的 60秒超时限制
-            mcp_safe_timeout = 300
+            # MCP 客户端（如 Claude Desktop）通常有 60 秒的请求超时限制
+            # 设置一个略短的超时以确保在 MCP 超时前返回结果
+            # 如果 IMA 响应时间过长，将返回部分结果
+            mcp_safe_timeout = 50  # 50秒，留出 10 秒缓冲
+            
+            logger.info(f"⏱️ 开始处理问题（超时限制: {mcp_safe_timeout}秒）")
+            logger.info(f"📝 问题内容: {question[:100]}{'...' if len(question) > 100 else ''}")
             
             # 将超时控制传递给 ask_question_complete，以便在超时时返回部分结果
-            messages = await ima_client.ask_question_complete(question, timeout=mcp_safe_timeout)
+            import asyncio
+            try:
+                messages = await asyncio.wait_for(
+                    ima_client.ask_question_complete(question, timeout=mcp_safe_timeout),
+                    timeout=mcp_safe_timeout + 5  # 外层超时稍长一点
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"❌ MCP 服务器层面超时（{mcp_safe_timeout + 5}秒）")
+                return [TextContent(
+                    type="text", 
+                    text=f"[ERROR] 请求超时（超过 {mcp_safe_timeout}秒）。IMA 响应时间过长，请尝试简化问题或稍后重试。"
+                )]
             
             # 即使没有消息，也会返回包含错误信息的消息列表
             if not messages:
